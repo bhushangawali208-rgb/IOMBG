@@ -1,0 +1,548 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ==================== HELPER FUNCTIONS ====================
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    function isSuperAdmin() {
+      return isAuthenticated() && (
+        (exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+         (get(/databases/$(database)/documents/users/$(request.auth.uid)).data.get('role', '') == "SUPER_ADMIN" ||
+          get(/databases/$(database)/documents/users/$(request.auth.uid)).data.get('accountType', '') == "SUPER_ADMIN")) ||
+        request.auth.token.role == "SUPER_ADMIN"
+      );
+    }
+
+    // ==================== USER PROFILES ====================
+    // Protects: role, accountType, isSuperAdmin, isVerified, isPremium, financial, and audit fields
+    match /users/{userId} {
+      // Authenticated users can read profiles
+      allow read: if isAuthenticated();
+
+      // Normal users CANNOT grant themselves SUPER_ADMIN, verified, or premium upon registration
+      allow create: if isAuthenticated() && request.auth.uid == userId &&
+        request.resource.data.uid == userId &&
+        request.resource.data.get('role', 'VIEWER') != "SUPER_ADMIN" &&
+        request.resource.data.get('accountType', 'VIEWER') != "SUPER_ADMIN" &&
+        request.resource.data.get('isSuperAdmin', false) != true &&
+        request.resource.data.get('isVerified', false) != true &&
+        request.resource.data.get('isPremium', false) != true;
+
+      // Normal users can only update permitted profile fields; strictly blocks role escalation & field injection
+      allow update: if isSuperAdmin() || (
+        isOwner(userId) &&
+        request.resource.data.uid == userId &&
+        !request.resource.data.diff(resource.data).affectedKeys().hasAny([
+          'role', 'accountType', 'isSuperAdmin', 'isVerified', 'isPremium',
+          'premiumExpiresAt', 'createdAt', 'uid', 'walletBalance', 'earnings',
+          'payoutStatus', 'fraudRisk', 'trustScore', 'adminNotes'
+        ])
+      );
+
+      allow delete: if isOwner(userId) || isSuperAdmin();
+
+      // Subcollection for device push notification tokens
+      // Users may only read, register, update, and delete their own device tokens; prevents token snooping
+      match /notificationTokens/{tokenId} {
+        allow read: if isAuthenticated() && (request.auth.uid == userId || isSuperAdmin());
+        allow create, update: if isAuthenticated() && request.auth.uid == userId &&
+          request.resource.data.token is string &&
+          request.resource.data.token.size() > 0 &&
+          !request.resource.data.diff({}).affectedKeys().hasAny([
+            'role', 'accountType', 'isSuperAdmin', 'isAdmin', 'isVerified'
+          ]);
+        allow delete: if isAuthenticated() && (request.auth.uid == userId || isSuperAdmin());
+      }
+
+      // ==================== USER WATCH HISTORY ====================
+      // Subcollection for user-scoped cloud watch history sync: users/{userId}/watchHistory/{historyId}
+      // Enforces strict user isolation: only the authenticated owner can read/write/delete their watch history.
+      // Super Admin access matches existing platform security architecture.
+      match /watchHistory/{historyId} {
+        allow read: if isAuthenticated() && (request.auth.uid == userId || isSuperAdmin());
+        allow create: if isAuthenticated() && request.auth.uid == userId &&
+          request.resource.data.userId == userId &&
+          request.resource.data.historyId is string &&
+          request.resource.data.contentType in ['VIDEO', 'SHORT'] &&
+          request.resource.data.contentId is string &&
+          request.resource.data.contentId.size() > 0 &&
+          !request.resource.data.diff({}).affectedKeys().hasAny([
+            'role', 'accountType', 'isSuperAdmin', 'isAdmin', 'isVerified',
+            'wallet', 'walletBalance', 'earnings', 'payoutStatus', 'likesCount',
+            'viewCount', 'views', 'subscriberCount', 'commentCount'
+          ]);
+        allow update: if isAuthenticated() && request.auth.uid == userId &&
+          request.resource.data.userId == userId &&
+          !request.resource.data.diff(resource.data).affectedKeys().hasAny([
+            'userId', 'historyId', 'contentType', 'contentId',
+            'role', 'accountType', 'isSuperAdmin', 'isAdmin', 'isVerified',
+            'wallet', 'walletBalance', 'earnings', 'payoutStatus', 'likesCount',
+            'viewCount', 'views', 'subscriberCount', 'commentCount'
+          ]);
+        allow delete: if isAuthenticated() && (request.auth.uid == userId || isSuperAdmin());
+      }
+    }
+
+    // ==================== ACCOUNT DELETION REQUESTS ====================
+    match /accountDeletionRequests/{requestId} {
+      allow read: if isSuperAdmin() || (isAuthenticated() && resource.data.uid == request.auth.uid);
+      allow create: if isAuthenticated() && request.resource.data.uid == request.auth.uid;
+      allow update, delete: if isSuperAdmin();
+    }
+
+    // ==================== CHANNELS ====================
+    // Protects: ownerUid, subscriberCount, monetizationStatus, isMonetized, totalViews, totalWatchHours
+    match /channels/{channelId} {
+      allow read: if true;
+
+      // Creation allowed only for authenticated user setting themselves as owner with zeroed counters
+      allow create: if isAuthenticated() &&
+        request.resource.data.ownerUid == request.auth.uid &&
+        request.resource.data.get('subscriberCount', 0) == 0 &&
+        request.resource.data.get('totalViews', 0) == 0 &&
+        request.resource.data.get('isMonetized', false) == false &&
+        request.resource.data.get('monetizationStatus', 'NOT_APPLIED') == 'NOT_APPLIED';
+
+      // Updates:
+      // 1. Channel Owner may update presentation fields (cannot transfer ownership, alter counters, or approve monetization)
+      // 2. Interacting followers may strictly increment/decrement subscriberCount by 1 (Spark client-increment compatibility)
+      // 3. Super Admin has unrestricted operational access
+      allow update: if isSuperAdmin() ||
+        (
+          isAuthenticated() && resource.data.ownerUid == request.auth.uid &&
+          request.resource.data.ownerUid == resource.data.ownerUid &&
+          !request.resource.data.diff(resource.data).affectedKeys().hasAny([
+            'ownerUid', 'channelId', 'subscriberCount', 'isMonetized',
+            'monetizationStatus', 'totalViews', 'totalWatchHours', 'createdAt',
+            'fraudRisk', 'isVerified', 'wallet', 'earnings'
+          ])
+        ) ||
+        (
+          isAuthenticated() &&
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['subscriberCount']) &&
+          (
+            request.resource.data.subscriberCount == resource.data.subscriberCount + 1 ||
+            request.resource.data.subscriberCount == resource.data.subscriberCount - 1
+          )
+        ) ||
+        (
+          isAuthenticated() && resource.data.ownerUid == request.auth.uid &&
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['videoCount'])
+        ) ||
+        (
+          isAuthenticated() && resource.data.ownerUid == request.auth.uid &&
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['shortsCount'])
+        );
+
+      allow delete: if isAuthenticated() && (resource.data.ownerUid == request.auth.uid || isSuperAdmin());
+    }
+
+    // ==================== VIDEOS ====================
+    // Protects: ownerUid, viewCount, likeCount, commentCount, shareCount, isBoosted, monetization, moderation
+    match /videos/{videoId} {
+      allow read: if resource.data.visibility == 'PUBLIC' ||
+                     (isAuthenticated() && (resource.data.ownerUid == request.auth.uid || isSuperAdmin()));
+
+      // New video must be created by authenticated owner with zero metrics
+      allow create: if isAuthenticated() &&
+        request.resource.data.ownerUid == request.auth.uid &&
+        request.resource.data.get('viewCount', 0) == 0 &&
+        request.resource.data.get('likeCount', 0) == 0 &&
+        request.resource.data.get('commentCount', 0) == 0 &&
+        request.resource.data.get('shareCount', 0) == 0 &&
+        request.resource.data.get('isBoosted', false) == false;
+
+      // Updates:
+      // 1. Owner updates video details without modifying metrics, boost, or ownership
+      // 2. Interacting users strictly increment/decrement likeCount or commentCount by 1
+      // 3. Super Admin
+      allow update: if isSuperAdmin() ||
+        (
+          isAuthenticated() && resource.data.ownerUid == request.auth.uid &&
+          request.resource.data.ownerUid == resource.data.ownerUid &&
+          !request.resource.data.diff(resource.data).affectedKeys().hasAny([
+            'ownerUid', 'videoId', 'channelId', 'viewCount', 'likeCount',
+            'commentCount', 'shareCount', 'isBoosted', 'createdAt',
+            'isBanned', 'fraudRisk', 'moderationNotes'
+          ])
+        ) ||
+        (
+          isAuthenticated() &&
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['likeCount']) &&
+          (
+            request.resource.data.likeCount == resource.data.likeCount + 1 ||
+            request.resource.data.likeCount == resource.data.likeCount - 1
+          )
+        ) ||
+        (
+          isAuthenticated() &&
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['commentCount']) &&
+          (
+            request.resource.data.commentCount == resource.data.commentCount + 1 ||
+            request.resource.data.commentCount == resource.data.commentCount - 1
+          )
+        );
+
+      allow delete: if isAuthenticated() && (resource.data.ownerUid == request.auth.uid || isSuperAdmin());
+    }
+
+    // ==================== SHORTS ====================
+    // Protects: ownerUid, viewCount, likeCount, commentCount, shareCount, isBoosted, monetization, moderation
+    match /shorts/{shortId} {
+      allow read: if resource.data.visibility == 'PUBLIC' ||
+                     (isAuthenticated() && (resource.data.ownerUid == request.auth.uid || isSuperAdmin()));
+
+      // New short must be created by authenticated owner with zero metrics
+      allow create: if isAuthenticated() &&
+        request.resource.data.ownerUid == request.auth.uid &&
+        request.resource.data.get('viewCount', 0) == 0 &&
+        request.resource.data.get('likeCount', 0) == 0 &&
+        request.resource.data.get('commentCount', 0) == 0 &&
+        request.resource.data.get('shareCount', 0) == 0 &&
+        request.resource.data.get('isBoosted', false) == false;
+
+      // Updates:
+      // 1. Owner updates short metadata (cannot alter metrics, boost, or ownership)
+      // 2. Interacting users strictly increment/decrement likeCount or commentCount by 1
+      // 3. Super Admin
+      allow update: if isSuperAdmin() ||
+        (
+          isAuthenticated() && resource.data.ownerUid == request.auth.uid &&
+          request.resource.data.ownerUid == resource.data.ownerUid &&
+          !request.resource.data.diff(resource.data).affectedKeys().hasAny([
+            'ownerUid', 'shortId', 'channelId', 'viewCount', 'likeCount',
+            'commentCount', 'shareCount', 'isBoosted', 'createdAt',
+            'isBanned', 'fraudRisk', 'moderationNotes'
+          ])
+        ) ||
+        (
+          isAuthenticated() &&
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['likeCount']) &&
+          (
+            request.resource.data.likeCount == resource.data.likeCount + 1 ||
+            request.resource.data.likeCount == resource.data.likeCount - 1
+          )
+        ) ||
+        (
+          isAuthenticated() &&
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['commentCount']) &&
+          (
+            request.resource.data.commentCount == resource.data.commentCount + 1 ||
+            request.resource.data.commentCount == resource.data.commentCount - 1
+          )
+        );
+
+      allow delete: if isAuthenticated() && (resource.data.ownerUid == request.auth.uid || isSuperAdmin());
+    }
+
+    // ==================== LIKES ====================
+    // User can only create/delete their own like document; document ID enforces 1:1 relationship
+    match /likes/{likeId} {
+      allow read: if isAuthenticated();
+      allow create: if isAuthenticated() &&
+        request.resource.data.userId == request.auth.uid &&
+        likeId == request.auth.uid + '_' + request.resource.data.contentId;
+      allow update: if false; // Likes are immutable
+      allow delete: if isAuthenticated() && resource.data.userId == request.auth.uid;
+    }
+
+    // ==================== FOLLOWS / SUBSCRIPTIONS ====================
+    // User can only create/delete their own follow relationship; document ID enforces unique follower:channel
+    match /follows/{followId} {
+      allow read: if isAuthenticated();
+      allow create: if isAuthenticated() &&
+        request.resource.data.followerUid == request.auth.uid &&
+        followId == request.auth.uid + '_' + request.resource.data.targetChannelId;
+      allow update: if false; // Follow records are immutable
+      allow delete: if isAuthenticated() && resource.data.followerUid == request.auth.uid;
+    }
+
+    // ==================== COMMENTS & REPLIES ====================
+    match /comments/{commentId} {
+      allow read: if true;
+
+      // Author can create comment with zero counts and non-pinned status
+      allow create: if isAuthenticated() &&
+        request.resource.data.authorUid == request.auth.uid &&
+        request.resource.data.get('likeCount', 0) == 0 &&
+        request.resource.data.get('replyCount', 0) == 0 &&
+        request.resource.data.get('isPinned', false) == false;
+
+      // Updates:
+      // 1. Author editing comment text (cannot change authorUid or pin)
+      // 2. Interacting users incrementing/decrementing likeCount or adding replies
+      // 3. Super Admin
+      allow update: if isSuperAdmin() ||
+        (
+          isAuthenticated() && resource.data.authorUid == request.auth.uid &&
+          request.resource.data.authorUid == resource.data.authorUid &&
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['text', 'updatedAt', 'isEdited'])
+        ) ||
+        (
+          isAuthenticated() &&
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['likeCount']) &&
+          (
+            request.resource.data.likeCount == resource.data.likeCount + 1 ||
+            request.resource.data.likeCount == resource.data.likeCount - 1
+          )
+        ) ||
+        (
+          isAuthenticated() &&
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['replyCount', 'replies', 'updatedAt']) &&
+          request.resource.data.authorUid == resource.data.authorUid
+        );
+
+      allow delete: if isAuthenticated() && (resource.data.authorUid == request.auth.uid || isSuperAdmin());
+    }
+
+    // ==================== NOTIFICATIONS ====================
+    match /notifications/{notificationId} {
+      // User can only read notifications addressed to themselves
+      allow read: if isAuthenticated() && resource.data.recipientUid == request.auth.uid;
+
+      // Interacting user can create notification with verified sender identity and standard types; cannot forge system notifications
+      allow create: if isSuperAdmin() || (
+        isAuthenticated() &&
+        request.resource.data.recipientUid is string &&
+        request.resource.data.recipientUid.size() > 0 &&
+        request.resource.data.senderUid == request.auth.uid &&
+        request.resource.data.recipientUid != request.auth.uid &&
+        request.resource.data.type in ['LIKE', 'VIDEO_LIKE', 'COMMENT', 'NEW_FOLLOWER', 'NEW_MESSAGE'] &&
+        !request.resource.data.diff({}).affectedKeys().hasAny(['isAdminBroadcast', 'isSystemNotification', 'systemAction'])
+      );
+
+      // Recipient can only update read status metadata
+      allow update: if isAuthenticated() &&
+        resource.data.recipientUid == request.auth.uid &&
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['isRead', 'readAt', 'updatedAt']);
+
+      allow delete: if isAuthenticated() && resource.data.recipientUid == request.auth.uid;
+    }
+
+    // ==================== DIRECT MESSAGING & CHATS ====================
+    match /conversations/{conversationId} {
+      // Only conversation participants can read conversation metadata
+      allow read: if isAuthenticated() && (request.auth.uid in resource.data.participantUids || isSuperAdmin());
+
+      // Only valid participants can create conversation; participant list size strictly enforced to 2
+      allow create: if isAuthenticated() &&
+        (request.auth.uid in request.resource.data.participantUids) &&
+        request.resource.data.participantUids.size() == 2;
+
+      // Participants cannot modify or reassign the participant list
+      allow update: if isAuthenticated() &&
+        (request.auth.uid in resource.data.participantUids) &&
+        request.resource.data.participantUids == resource.data.participantUids;
+
+      allow delete: if isSuperAdmin() || (isAuthenticated() && request.auth.uid in resource.data.participantUids);
+
+      match /messages/{messageId} {
+        allow read: if isAuthenticated() && (
+          request.auth.uid in get(/databases/$(database)/documents/conversations/$(conversationId)).data.participantUids ||
+          isSuperAdmin()
+        );
+
+        allow create: if isAuthenticated() &&
+          (request.auth.uid in get(/databases/$(database)/documents/conversations/$(conversationId)).data.participantUids) &&
+          request.resource.data.senderUid == request.auth.uid;
+
+        allow update: if isSuperAdmin() ||
+          (
+            // Sender can edit text or soft delete own message
+            isAuthenticated() && resource.data.senderUid == request.auth.uid &&
+            request.resource.data.senderUid == resource.data.senderUid &&
+            request.resource.data.diff(resource.data).affectedKeys().hasOnly(['text', 'isEdited', 'editedAt', 'isDeleted', 'deletedAt', 'updatedAt'])
+          ) ||
+          (
+            // Receiver can mark delivery and read status
+            isAuthenticated() && resource.data.receiverUid == request.auth.uid &&
+            request.resource.data.receiverUid == resource.data.receiverUid &&
+            request.resource.data.diff(resource.data).affectedKeys().hasOnly(['isRead', 'readAt', 'deliveredAt', 'deliveryStatus', 'updatedAt'])
+          );
+
+        allow delete: if isAuthenticated() && (
+          resource.data.senderUid == request.auth.uid || isSuperAdmin()
+        );
+      }
+    }
+
+    // ==================== LIVE STREAMING & CHAT ====================
+    match /liveStreams/{streamId} {
+      allow read: if true;
+      allow create: if isAuthenticated() && request.resource.data.hostUid == request.auth.uid;
+
+      // Host cannot transfer ownership or touch fraud/ban fields
+      allow update: if isSuperAdmin() || (
+        isAuthenticated() && resource.data.hostUid == request.auth.uid &&
+        request.resource.data.hostUid == resource.data.hostUid &&
+        !request.resource.data.diff(resource.data).affectedKeys().hasAny([
+          'hostUid', 'streamId', 'isBanned', 'fraudRisk', 'superAdminOverride'
+        ])
+      );
+
+      allow delete: if isAuthenticated() && (resource.data.hostUid == request.auth.uid || isSuperAdmin());
+
+      match /messages/{messageId} {
+        allow read: if true;
+        allow create: if isAuthenticated() && request.resource.data.senderUid == request.auth.uid;
+        allow update: if false; // Live chat messages are immutable
+        allow delete: if isAuthenticated() && (
+          resource.data.senderUid == request.auth.uid ||
+          get(/databases/$(database)/documents/liveStreams/$(streamId)).data.hostUid == request.auth.uid ||
+          isSuperAdmin()
+        );
+      }
+    }
+
+    // ==================== FINANCIAL LEDGER & WALLETS ====================
+    // STRICT SECURITY: Wallets and Ledger entries are SERVER/ADMIN authoritative.
+    // Clients can read their own balances, but normal clients CANNOT write or tamper with financial documents.
+    match /wallets/{walletId} {
+      allow read: if isAuthenticated() && (
+        resource.data.ownerUid == request.auth.uid || isSuperAdmin()
+      );
+      allow write: if isSuperAdmin();
+    }
+
+    match /ledgerEntries/{entryId} {
+      allow read: if isAuthenticated() && (
+        resource.data.channelOwnerUid == request.auth.uid || isSuperAdmin()
+      );
+      allow write: if isSuperAdmin();
+    }
+
+    // ==================== CREATOR MONETIZATION & PAYOUTS ====================
+    // Normal clients cannot self-approve monetization or payout requests
+    match /monetizationApplications/{appId} {
+      allow read: if isAuthenticated() && (
+        resource.data.applicantUid == request.auth.uid || isSuperAdmin()
+      );
+      allow create: if isAuthenticated() &&
+        request.resource.data.applicantUid == request.auth.uid &&
+        request.resource.data.get('status', 'PENDING') == 'PENDING';
+      allow update, delete: if isSuperAdmin();
+    }
+
+    match /payoutRequests/{payoutId} {
+      allow read: if isAuthenticated() && (
+        resource.data.creatorUid == request.auth.uid || isSuperAdmin()
+      );
+      allow create: if isAuthenticated() &&
+        request.resource.data.creatorUid == request.auth.uid &&
+        request.resource.data.get('status', 'PENDING') == 'PENDING';
+      allow update, delete: if isSuperAdmin();
+    }
+
+    // ==================== BOOST CAMPAIGNS & PREMIUM ====================
+    match /boostCampaigns/{campaignId} {
+      allow read: if isAuthenticated() && (
+        resource.data.creatorUid == request.auth.uid || isSuperAdmin()
+      );
+      allow create: if isAuthenticated() && request.resource.data.creatorUid == request.auth.uid;
+      allow update: if isSuperAdmin() || (
+        isAuthenticated() && resource.data.creatorUid == request.auth.uid &&
+        request.resource.data.creatorUid == resource.data.creatorUid &&
+        !request.resource.data.diff(resource.data).affectedKeys().hasAny(['status', 'adminNotes', 'approvedBy'])
+      );
+      allow delete: if isSuperAdmin();
+    }
+
+    match /subscriptions/{subscriptionId} {
+      allow read: if isAuthenticated() && (
+        resource.data.userId == request.auth.uid || isSuperAdmin()
+      );
+      allow write: if isSuperAdmin();
+    }
+
+    // ==================== BLOCKS & USER SAFETY ====================
+    match /blocks/{blockId} {
+      allow read: if isAuthenticated() && resource.data.blockerUid == request.auth.uid;
+      allow create: if isAuthenticated() &&
+        request.resource.data.blockerUid == request.auth.uid &&
+        blockId == request.auth.uid + '_' + request.resource.data.blockedUid;
+      allow update: if false; // Block records are immutable
+      allow delete: if isAuthenticated() && resource.data.blockerUid == request.auth.uid;
+    }
+
+    // ==================== REPORTS & MODERATION ====================
+    match /reports/{reportId} {
+      // Authenticated users can file reports with initial submission fields only
+      allow create: if isAuthenticated() &&
+        request.resource.data.reporterUid == request.auth.uid &&
+        !request.resource.data.diff({}).affectedKeys().hasAny([
+          'status', 'resolution', 'resolvedBy', 'actionTaken', 'adminNotes'
+        ]);
+      // Only Super Admin can view, triage, and resolve reports
+      allow read, update, delete: if isSuperAdmin();
+    }
+
+    // ==================== USER PRESENCE & CHAT SETTINGS ====================
+    match /presences/{userId} {
+      allow read: if isAuthenticated();
+      allow create, update: if isAuthenticated() && request.auth.uid == userId;
+      allow delete: if isAuthenticated() && (request.auth.uid == userId || isSuperAdmin());
+    }
+
+    match /chatSettings/{userId} {
+      allow read: if isAuthenticated();
+      allow create, update: if isAuthenticated() && request.auth.uid == userId;
+      allow delete: if isAuthenticated() && (request.auth.uid == userId || isSuperAdmin());
+    }
+
+    // ==================== RECOMMENDATION SIGNALS ====================
+    match /recommendationEvents/{eventId} {
+      allow read: if isAuthenticated() && (resource.data.userId == request.auth.uid || isSuperAdmin());
+      allow create: if isAuthenticated() && (
+        request.resource.data.userId == request.auth.uid ||
+        request.resource.data.userId == 'anonymous'
+      );
+      allow update: if false; // Events are append-only telemetry
+      allow delete: if isSuperAdmin();
+    }
+
+    // ==================== FRAUD ALERTS & SECURITY ====================
+    match /fraudAlerts/{alertId} {
+      allow read, write: if isSuperAdmin();
+    }
+
+    match /fraudSignals/{signalId} {
+      allow read, write: if isSuperAdmin();
+    }
+
+    // ==================== AUDIT LOGS, BROADCASTS & PLATFORM CONFIG ====================
+    match /adminAuditLogs/{logId} {
+      // Append-only for admin operations, strictly readable only by Super Admin.
+      // Updates and deletions are permanently prohibited (immutable audit trail).
+      allow read: if isSuperAdmin();
+      allow create: if isSuperAdmin();
+      allow update, delete: if false;
+    }
+
+    match /adminAnnouncements/{announcementId} {
+      allow read: if isAuthenticated();
+      allow write: if isSuperAdmin();
+    }
+
+    match /platformSettings/{settingId} {
+      allow read: if isAuthenticated();
+      allow write: if isSuperAdmin();
+    }
+
+    match /platform_config/{configId} {
+      allow read: if isAuthenticated();
+      allow write: if isSuperAdmin();
+    }
+
+    // Default deny all other unspecified collections
+    match /{document=**} {
+      allow read, write: if isSuperAdmin();
+    }
+  }
+}
